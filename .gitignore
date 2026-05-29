@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+# Local browser sessions / profiles
+profiles/
+chatgpt/
+deepseek/
+doubao/
+kimi/
+qianwen_cn/
+qwen/
+test/
+yiyan/
+yuanbao/
+zhipu/
+
+# Local debug screenshots
+*-submit.png
+*-login.png
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
