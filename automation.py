@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -20,6 +21,10 @@ except ImportError:  # pragma: no cover - import guard for first-run setup
 
 
 StatusCallback = Callable[[str, str, str], None]
+
+
+class TaskCancelledError(RuntimeError):
+    pass
 
 ANTI_DETECTION_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -103,6 +108,7 @@ class ProviderRunner:
         channel: str,
         headless: bool,
         status_callback: StatusCallback | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.provider = provider
         self.profile_dir = profile_root / provider.key
@@ -111,17 +117,19 @@ class ProviderRunner:
         self.channel = channel
         self.headless = headless
         self.status_callback = status_callback
+        self.stop_event = stop_event
         self.context = None
         self.page = None
         self._observed_page = None
         self._last_submission_error = ""
 
     def open(self) -> None:
+        self._check_stopped()
         page = self._ensure_page()
         self._last_submission_error = ""
         self._notify("opening", "已打开网页")
         page.goto(self.provider.url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(self.provider.open_wait_ms)
+        self._wait_or_stop(page, self.provider.open_wait_ms)
         self._dismiss_interfering_ui(page)
         if self._find_input(page) is None:
             self._notify("waiting_login", "请在浏览器中完成登录后再提问")
@@ -129,11 +137,12 @@ class ProviderRunner:
             self._notify("ready", "已就绪")
 
     def ask(self, question: str, timeout_seconds: int) -> ProviderAnswer:
+        self._check_stopped()
         page = self._ensure_page()
         self._last_submission_error = ""
         self._notify("navigating", "正在进入聊天页")
         page.goto(self.provider.url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(self.provider.open_wait_ms)
+        self._wait_or_stop(page, self.provider.open_wait_ms)
         self._dismiss_interfering_ui(page)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
@@ -172,6 +181,9 @@ class ProviderRunner:
                 self.context = None
                 self.page = None
 
+    def set_stop_event(self, stop_event: threading.Event | None) -> None:
+        self.stop_event = stop_event
+
     def _ensure_page(self):
         if self.context is None:
             self._notify("launching", "正在启动浏览器")
@@ -198,13 +210,14 @@ class ProviderRunner:
 
     def _dismiss_interfering_ui(self, page: Page) -> None:
         for _ in range(2):
+            self._check_stopped()
             closed_any = False
             for selector in self.provider.popup_close_selectors:
                 try:
                     locator = page.locator(selector).first
                     if locator.count() and locator.is_visible():
                         locator.click(timeout=2500)
-                        page.wait_for_timeout(500)
+                        self._wait_or_stop(page, 500)
                         closed_any = True
                 except Exception:
                     continue
@@ -228,11 +241,12 @@ class ProviderRunner:
         return None
 
     def _fill_prompt(self, page: Page, editor: Locator, text: str) -> None:
+        self._check_stopped()
         self._focus_editor(page, editor)
         page.keyboard.press("Control+A")
-        page.wait_for_timeout(80)
+        self._wait_or_stop(page, 80)
         page.keyboard.press("Backspace")
-        page.wait_for_timeout(120)
+        self._wait_or_stop(page, 120)
         input_mode = editor.evaluate(
             "(el) => el && (el.isContentEditable ? 'contenteditable' : (el.tagName || '').toLowerCase())"
         )
@@ -254,10 +268,12 @@ class ProviderRunner:
             raise RuntimeError("输入框内容写入不完整，请确认当前平台聊天页处于可输入状态。")
 
     def _focus_editor(self, page: Page, editor: Locator) -> None:
+        self._check_stopped()
         editor.click(timeout=6000, force=True)
-        page.wait_for_timeout(150)
+        self._wait_or_stop(page, 150)
 
     def _submit(self, page: Page, editor: Locator) -> None:
+        self._check_stopped()
         self._dismiss_interfering_ui(page)
         self._focus_editor(page, editor)
         if self.provider.key == "yiyan":
@@ -265,7 +281,7 @@ class ProviderRunner:
             return
 
         page.keyboard.press(self.provider.submit_key)
-        page.wait_for_timeout(800)
+        self._wait_or_stop(page, 800)
 
         current_after_enter = self._normalize_text(self._read_editor_text(editor))
         if current_after_enter and self.provider.submit_selectors:
@@ -273,23 +289,24 @@ class ProviderRunner:
             if target is not None:
                 try:
                     target.click(timeout=4000, force=True)
-                    page.wait_for_timeout(1200)
+                    self._wait_or_stop(page, 1200)
                 except Exception:
                     pass
 
     def _submit_with_response_capture(self, page: Page, editor: Locator) -> None:
+        self._check_stopped()
         response = None
         try:
             with page.expect_response(lambda item: "/eb/chat/conversation/v2" in item.url, timeout=10000) as pending:
                 page.keyboard.press(self.provider.submit_key)
-                page.wait_for_timeout(800)
+                self._wait_or_stop(page, 800)
 
                 current_after_enter = self._normalize_text(self._read_editor_text(editor))
                 if current_after_enter and self.provider.submit_selectors:
                     target = self._find_submit_target(page)
                     if target is not None:
                         target.click(timeout=4000, force=True)
-                        page.wait_for_timeout(1200)
+                        self._wait_or_stop(page, 1200)
             response = pending.value
         except Exception:
             return
@@ -304,9 +321,10 @@ class ProviderRunner:
         previous_normalized = self._normalize_text(previous_answer)
 
         while time.monotonic() < deadline:
+            self._check_stopped()
             if self._last_submission_error:
                 raise RuntimeError(f"{self.provider.name} 返回错误：{self._last_submission_error}")
-            page.wait_for_timeout(2000)
+            self._wait_or_stop(page, 2000)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             current = self._extract_answer(page)
             if not self._looks_like_answer(current):
@@ -410,6 +428,19 @@ class ProviderRunner:
         if self.status_callback is not None:
             self.status_callback(self.provider.key, status, message)
 
+    def _check_stopped(self) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise TaskCancelledError("任务已被强制结束")
+
+    def _wait_or_stop(self, page: Page, wait_ms: int) -> None:
+        remaining = max(wait_ms, 0)
+        while remaining > 0:
+            self._check_stopped()
+            step = min(remaining, 200)
+            page.wait_for_timeout(step)
+            remaining -= step
+        self._check_stopped()
+
     def _handle_response(self, response) -> None:
         if self.provider.key != "yiyan":
             return
@@ -460,10 +491,17 @@ class AutomationManager:
         self.channel = channel
         self.headless = headless
         self.status_callback = status_callback
+        self.stop_event: threading.Event | None = None
         self._playwright_manager = sync_playwright().start()
         self.runners: dict[str, ProviderRunner] = {}
 
-    def warm_up(self, providers: tuple[ProviderConfig, ...]) -> None:
+    def warm_up(
+        self,
+        providers: tuple[ProviderConfig, ...],
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.stop_event = stop_event
+        self._sync_runners(providers)
         for provider in providers:
             runner = self._get_runner(provider)
             runner.open()
@@ -473,9 +511,12 @@ class AutomationManager:
         providers: tuple[ProviderConfig, ...],
         question: str,
         timeout_seconds: int,
+        stop_event: threading.Event | None = None,
     ) -> list[ProviderAnswer]:
+        self.stop_event = stop_event
+        self._sync_runners(providers)
         if self.headless and len(providers) > 1:
-            return self._ask_all_parallel(providers, question, timeout_seconds)
+            return self._ask_all_parallel(providers, question, timeout_seconds, stop_event)
 
         results: list[ProviderAnswer] = []
         for provider in providers:
@@ -497,12 +538,13 @@ class AutomationManager:
         providers: tuple[ProviderConfig, ...],
         question: str,
         timeout_seconds: int,
+        stop_event: threading.Event | None,
     ) -> list[ProviderAnswer]:
         results_by_key: dict[str, ProviderAnswer] = {}
 
         with ThreadPoolExecutor(max_workers=len(providers), thread_name_prefix="headless-ask") as executor:
             future_map = {
-                executor.submit(self._ask_provider_isolated, provider, question, timeout_seconds): provider
+                executor.submit(self._ask_provider_isolated, provider, question, timeout_seconds, stop_event): provider
                 for provider in providers
             }
             for future in as_completed(future_map):
@@ -526,6 +568,7 @@ class AutomationManager:
         provider: ProviderConfig,
         question: str,
         timeout_seconds: int,
+        stop_event: threading.Event | None,
     ) -> ProviderAnswer:
         if sync_playwright is None:
             raise RuntimeError("Playwright 不可用。")
@@ -540,6 +583,7 @@ class AutomationManager:
                 channel=self.channel,
                 headless=self.headless,
                 status_callback=self.status_callback,
+                stop_event=stop_event,
             )
             return runner.ask(question, timeout_seconds)
         except Exception as exc:
@@ -565,6 +609,13 @@ class AutomationManager:
             self._playwright_manager.stop()
             self._playwright_manager = None
 
+    def _sync_runners(self, providers: tuple[ProviderConfig, ...]) -> None:
+        selected_keys = {provider.key for provider in providers}
+        for provider_key in tuple(self.runners):
+            if provider_key not in selected_keys:
+                self.runners[provider_key].close()
+                del self.runners[provider_key]
+
     def _get_runner(self, provider: ProviderConfig) -> ProviderRunner:
         if provider.key not in self.runners:
             self.runners[provider.key] = ProviderRunner(
@@ -574,5 +625,8 @@ class AutomationManager:
                 channel=self.channel,
                 headless=self.headless,
                 status_callback=self.status_callback,
+                stop_event=self.stop_event,
             )
+        else:
+            self.runners[provider.key].set_stop_event(self.stop_event)
         return self.runners[provider.key]
