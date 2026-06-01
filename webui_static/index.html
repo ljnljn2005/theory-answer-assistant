@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>理论题作答助手</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260531-2" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="titleblock">
+          <h1>理论题作答助手</h1>
+          <p id="statusText">准备就绪</p>
+        </div>
+        <div class="summary" id="summaryChips">
+          <span class="chip neutral">总 0</span>
+          <span class="chip amber">待执行 0</span>
+          <span class="chip cyan">运行中 0</span>
+          <span class="chip green">已完成 0</span>
+          <span class="chip rose">已失败 0</span>
+          <span class="chip slate">已终止 0</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="leftpane">
+          <section class="panel composer">
+            <div class="panel-head">
+              <h2>题目输入</h2>
+              <div class="toolbar">
+                <button id="openSessionsBtn" class="primary" type="button">打开网页会话</button>
+                <button id="enqueueBtn" type="button">加入队列</button>
+                <button id="forceStopBtn" class="danger" type="button">强制结束</button>
+                <button id="closeSessionsBtn" type="button">关闭会话</button>
+              </div>
+            </div>
+
+            <div class="controls-grid">
+              <label class="field">
+                <span>浏览器</span>
+                <select id="browserSelect">
+                  <option value="msedge">msedge</option>
+                  <option value="chrome">chrome</option>
+                  <option value="chromium">chromium</option>
+                </select>
+              </label>
+
+              <label class="field compact">
+                <span>单站超时</span>
+                <input id="timeoutInput" type="number" min="20" value="90" />
+              </label>
+
+              <label class="field compact">
+                <span>并发任务数</span>
+                <input id="parallelInput" type="number" min="1" max="8" value="1" />
+              </label>
+
+              <label class="field toggle">
+                <input id="showBrowserCheckbox" type="checkbox" />
+                <span>显示浏览器窗口</span>
+              </label>
+            </div>
+
+            <div class="providers" id="providerSelector"></div>
+
+            <textarea
+              id="questionInput"
+              spellcheck="false"
+              placeholder="把题目贴到这里。多道题之间用单独一行 --- 分隔。"
+            ></textarea>
+          </section>
+
+          <section class="panel queue-panel">
+            <div class="panel-head">
+              <h2>任务队列</h2>
+              <div class="toolbar">
+                <span class="queue-meta" id="queueMeta">队列：总 0 题</span>
+                <button id="clearQueueBtn" type="button">清空队列</button>
+              </div>
+            </div>
+            <div class="queue-table" id="queueTable"></div>
+          </section>
+        </section>
+
+        <section class="rightpane">
+          <section class="panel detail-panel">
+            <div class="panel-head">
+              <div>
+                <h2 id="detailTitle">结果详情</h2>
+                <p id="detailSubtitle">选择一条任务查看详情</p>
+              </div>
+              <div class="tabs">
+                <button id="tabResult" class="tab active" type="button">结果</button>
+                <button id="tabLog" class="tab" type="button">日志</button>
+              </div>
+            </div>
+
+            <div class="provider-table" id="providerStateTable"></div>
+
+            <div id="resultPane" class="detail-body active">
+              <pre id="resultText"></pre>
+            </div>
+
+            <div id="logPane" class="detail-body">
+              <pre id="logText"></pre>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <script src="/static/app.js?v=20260531-2"></script>
+  </body>
+</html>

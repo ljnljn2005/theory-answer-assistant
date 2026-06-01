@@ -61,6 +61,32 @@ PROVIDERS: tuple[ProviderConfig, ...] = (
         popup_close_selectors=("text=知道了", "text=关闭"),
     ),
     ProviderConfig(
+        key="chatgpt",
+        name="ChatGPT",
+        url="https://chatgpt.com/",
+        input_selectors=(
+            "#prompt-textarea",
+            "textarea[data-id='root']",
+            "textarea",
+            "div#prompt-textarea[contenteditable='true']",
+            "div[contenteditable='true'][data-lexical-editor='true']",
+            "[contenteditable='true']",
+            *COMMON_INPUT_SELECTORS,
+        ),
+        submit_selectors=(
+            "button[data-testid='send-button']",
+            "button[aria-label='Send prompt']",
+            "button[aria-label='发送消息']",
+        ),
+        answer_selectors=(
+            "[data-message-author-role='assistant'] .markdown",
+            "[data-message-author-role='assistant'] [data-start]",
+            "[data-message-author-role='assistant']",
+        ),
+        popup_close_selectors=("button[aria-label='Close']", "text=Close", "text=稍后"),
+        open_wait_ms=2200,
+    ),
+    ProviderConfig(
         key="qianwen_cn",
         name="千问国内版",
         url="https://www.qianwen.com/",

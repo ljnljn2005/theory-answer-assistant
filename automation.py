@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - import guard for first-run setup
 
 
 StatusCallback = Callable[[str, str, str], None]
+ResultCallback = Callable[[ProviderAnswer], None]
 
 
 class TaskCancelledError(RuntimeError):
@@ -30,8 +31,17 @@ ANTI_DETECTION_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+Object.defineProperty(navigator, 'userAgent', {
+  get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0'
+});
 window.chrome = window.chrome || { runtime: {} };
 """
+
+EDGE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
+)
 
 EXTRACT_ANSWER_SCRIPT = """
 (selectors) => {
@@ -97,6 +107,28 @@ READ_EDITOR_TEXT_SCRIPT = """
 }
 """
 
+WRITE_CONTENTEDITABLE_LINES_SCRIPT = """
+(el, value) => {
+  if (!el) return;
+  el.innerHTML = '';
+  const lines = String(value || '').split('\\n');
+  for (const line of lines) {
+    const p = document.createElement('p');
+    if (line) {
+      p.textContent = line;
+    } else {
+      p.appendChild(document.createElement('br'));
+    }
+    el.appendChild(p);
+  }
+  el.dispatchEvent(new InputEvent('input', {
+    bubbles: true,
+    inputType: 'insertText',
+    data: value,
+  }));
+}
+"""
+
 ANSWER_MARKER_RE = re.compile(r"(?:答案|answer)\s*[:：]", re.IGNORECASE)
 
 class ProviderRunner:
@@ -131,6 +163,9 @@ class ProviderRunner:
         page.goto(self.provider.url, wait_until="domcontentloaded", timeout=90000)
         self._wait_or_stop(page, self.provider.open_wait_ms)
         self._dismiss_interfering_ui(page)
+        if self._last_submission_error:
+            self._notify("waiting_login", self._last_submission_error)
+            return
         if self._find_input(page) is None:
             self._notify("waiting_login", "请在浏览器中完成登录后再提问")
         else:
@@ -144,6 +179,8 @@ class ProviderRunner:
         page.goto(self.provider.url, wait_until="domcontentloaded", timeout=90000)
         self._wait_or_stop(page, self.provider.open_wait_ms)
         self._dismiss_interfering_ui(page)
+        if self._last_submission_error:
+            raise RuntimeError(self._last_submission_error)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
         prompt = build_prompt(question)
@@ -159,7 +196,7 @@ class ProviderRunner:
         self._submit(page, editor)
 
         self._notify("waiting_answer", "正在等待回答")
-        answer_text = self._wait_for_answer(page, timeout_seconds, before_answer)
+        answer_text = self._wait_for_answer(page, timeout_seconds, before_answer, prompt)
         parsed_options = extract_options(answer_text)
 
         self._notify(
@@ -192,6 +229,7 @@ class ProviderRunner:
                 channel=self.channel,
                 headless=self.headless,
                 viewport={"width": 1440, "height": 960} if self.headless else None,
+                user_agent=EDGE_USER_AGENT,
                 ignore_default_args=["--enable-automation"],
                 args=["--disable-blink-features=AutomationControlled"],
             )
@@ -255,11 +293,17 @@ class ProviderRunner:
             editor.fill(text)
         elif self.provider.key == "yiyan":
             page.keyboard.type(text, delay=35)
+        elif self.provider.key == "yuanbao":
+            page.keyboard.type(text, delay=8)
         else:
             page.keyboard.insert_text(text)
 
         current = self._normalize_text(self._read_editor_text(editor))
         expected = self._normalize_text(text)
+        if current != expected and self.provider.key == "yuanbao":
+            editor.evaluate(WRITE_CONTENTEDITABLE_LINES_SCRIPT, text)
+            self._wait_or_stop(page, 300)
+            current = self._normalize_text(self._read_editor_text(editor))
         if self.provider.key == "yiyan":
             if not current:
                 raise RuntimeError("输入框内容写入不完整，请确认当前平台聊天页处于可输入状态。")
@@ -313,12 +357,19 @@ class ProviderRunner:
 
         self._remember_submission_error(response)
 
-    def _wait_for_answer(self, page: Page, timeout_seconds: int, previous_answer: str) -> str:
+    def _wait_for_answer(
+        self,
+        page: Page,
+        timeout_seconds: int,
+        previous_answer: str,
+        prompt_text: str,
+    ) -> str:
         deadline = time.monotonic() + timeout_seconds
         stable_hits = 0
         last_text = ""
         best_text = ""
         previous_normalized = self._normalize_text(previous_answer)
+        prompt_normalized = self._normalize_text(prompt_text)
 
         while time.monotonic() < deadline:
             self._check_stopped()
@@ -333,6 +384,10 @@ class ProviderRunner:
                     current = body_fallback
             current_normalized = self._normalize_text(current)
             if not current_normalized or current_normalized == previous_normalized:
+                continue
+            if prompt_normalized and current_normalized == prompt_normalized:
+                continue
+            if self._looks_like_speaker_label(current_normalized):
                 continue
 
             best_text = current
@@ -350,11 +405,49 @@ class ProviderRunner:
         raise PlaywrightTimeoutError(f"{self.provider.name} 在 {timeout_seconds} 秒内没有返回可提取答案。")
 
     def _extract_answer(self, page: Page) -> str:
+        if self.provider.key == "chatgpt":
+            return self._extract_chatgpt_answer(page)
         try:
             text = page.evaluate(EXTRACT_ANSWER_SCRIPT, list(self.provider.answer_selectors))
             return (text or "").strip()
         except Exception:
             return ""
+
+    def _extract_chatgpt_answer(self, page: Page) -> str:
+        for selector in self.provider.answer_selectors:
+            locator = page.locator(selector)
+            try:
+                total = locator.count()
+            except Exception:
+                continue
+
+            for index in range(total - 1, -1, -1):
+                candidate = locator.nth(index)
+                try:
+                    if not candidate.is_visible():
+                        continue
+                    text = (candidate.inner_text(timeout=4000) or "").strip()
+                except Exception:
+                    continue
+
+                text = self._clean_chatgpt_text(text)
+                if not text:
+                    continue
+                if self._looks_like_speaker_label(text):
+                    continue
+                return text
+        return ""
+
+    def _clean_chatgpt_text(self, text: str) -> str:
+        cleaned = self._normalize_text(text)
+        trailing_markers = (
+            "Is this conversation helpful so far?",
+            "到目前为止，此对话对你有帮助吗？",
+        )
+        for marker in trailing_markers:
+            if marker in cleaned:
+                cleaned = cleaned.split(marker, 1)[0].rstrip()
+        return cleaned
 
     def _extract_answer_from_body(self, page: Page) -> str:
         try:
@@ -377,6 +470,12 @@ class ProviderRunner:
             return False
         snippet = text[marker.start() : marker.start() + 120]
         return "<" not in snippet[:80]
+
+    def _looks_like_speaker_label(self, text: str) -> bool:
+        normalized = self._normalize_text(text).lower()
+        return bool(
+            re.fullmatch(r"(chatgpt|assistant|you|user|你|你说)\s*(?:说|said)?\s*[:：]?", normalized)
+        )
 
     def _find_submit_target(self, page: Page) -> Locator | None:
         for selector in self.provider.submit_selectors:
@@ -442,11 +541,13 @@ class ProviderRunner:
         self._check_stopped()
 
     def _handle_response(self, response) -> None:
-        if self.provider.key != "yiyan":
+        if self.provider.key == "yiyan" and "/eb/chat/conversation/v2" in response.url:
+            self._remember_submission_error(response)
             return
-        if "/eb/chat/conversation/v2" not in response.url:
+        if self.provider.key == "yuanbao" and "/api/getuserinfo" in response.url:
+            if response.status == 401:
+                self._last_submission_error = "腾讯元宝登录已过期，请重新在浏览器中登录后再使用无头模式。"
             return
-        self._remember_submission_error(response)
 
     def _remember_submission_error(self, response) -> None:
         try:
@@ -471,6 +572,54 @@ class ProviderRunner:
         return json.loads(text)
 
 
+def ask_provider_isolated(
+    workspace_root: Path,
+    provider: ProviderConfig,
+    question: str,
+    timeout_seconds: int,
+    channel: str = "msedge",
+    headless: bool = True,
+    status_callback: StatusCallback | None = None,
+    stop_event: threading.Event | None = None,
+    profile_root: Path | None = None,
+) -> ProviderAnswer:
+    if sync_playwright is None:
+        raise RuntimeError("Playwright 不可用。")
+
+    selected_profile_root = profile_root or (workspace_root / "profiles")
+    selected_profile_root.mkdir(parents=True, exist_ok=True)
+
+    playwright_manager = sync_playwright().start()
+    runner: ProviderRunner | None = None
+    try:
+        runner = ProviderRunner(
+            provider=provider,
+            profile_root=selected_profile_root,
+            playwright=playwright_manager,
+            channel=channel,
+            headless=headless,
+            status_callback=status_callback,
+            stop_event=stop_event,
+        )
+        return runner.ask(question, timeout_seconds)
+    except TaskCancelledError:
+        raise
+    except Exception as exc:
+        if runner is not None:
+            runner._notify("error", str(exc))
+        elif status_callback is not None:
+            status_callback(provider.key, "error", str(exc))
+        return ProviderAnswer(
+            provider_key=provider.key,
+            provider_name=provider.name,
+            error=str(exc),
+        )
+    finally:
+        if runner is not None:
+            runner.close()
+        playwright_manager.stop()
+
+
 class AutomationManager:
     def __init__(
         self,
@@ -478,6 +627,7 @@ class AutomationManager:
         channel: str = "msedge",
         headless: bool = False,
         status_callback: StatusCallback | None = None,
+        result_callback: ResultCallback | None = None,
     ) -> None:
         if sync_playwright is None:
             raise RuntimeError(
@@ -491,6 +641,7 @@ class AutomationManager:
         self.channel = channel
         self.headless = headless
         self.status_callback = status_callback
+        self.result_callback = result_callback
         self.stop_event: threading.Event | None = None
         self._playwright_manager = sync_playwright().start()
         self.runners: dict[str, ProviderRunner] = {}
@@ -531,6 +682,8 @@ class AutomationManager:
                     error=str(exc),
                 )
             results.append(result)
+            if self.result_callback is not None:
+                self.result_callback(result)
         return results
 
     def _ask_all_parallel(
@@ -560,6 +713,8 @@ class AutomationManager:
                         error=str(exc),
                     )
                 results_by_key[provider.key] = result
+                if self.result_callback is not None:
+                    self.result_callback(result)
 
         return [results_by_key[provider.key] for provider in providers]
 

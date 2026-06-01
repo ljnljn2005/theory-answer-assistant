@@ -17,6 +17,11 @@ zhipu/
 # Local debug screenshots
 *-submit.png
 *-login.png
+chatgpt-debug.png
+webui-*.png
+yuanbao-*.png
+webui-server.log
+webui-server.err.log
 
 # Editor / OS noise
 .DS_Store

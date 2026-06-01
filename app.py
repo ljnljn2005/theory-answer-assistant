@@ -9,7 +9,7 @@ from tkinter import BooleanVar, END, StringVar, Tk, messagebox
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
-from automation import AutomationManager
+from automation import AutomationManager, TaskCancelledError
 from consensus import ProviderAnswer, compute_consensus, format_options
 from providers import PROVIDERS, ProviderConfig
 
